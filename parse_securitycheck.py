@@ -144,23 +144,43 @@ def format_reddit(results):
     return lines
 
 
+def read_clipboard():
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        text = root.clipboard_get()
+        root.destroy()
+        return text
+    except Exception as e:
+        print(f"Error: Could not read clipboard: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
-        print("Usage: python parse_securitycheck.py <malwarebytes|reddit> <SecurityCheck.txt>")
+    if len(sys.argv) < 2:
+        print("Usage: python parse_securitycheck.py <malwarebytes|reddit> [SecurityCheck.txt]")
+        print("       If no file is given, clipboard content is used (must start with 'SecurityCheck by ').")
         sys.exit(1)
 
     mode = sys.argv[1].lower()
-    filename = sys.argv[2]
 
     if mode not in ('malwarebytes', 'reddit'):
         print(f"Error: Unknown mode '{mode}'. Use 'malwarebytes' or 'reddit'.", file=sys.stderr)
         sys.exit(1)
 
-    try:
-        content = read_file(filename)
-    except FileNotFoundError:
-        print(f"Error: File '{filename}' not found.", file=sys.stderr)
-        sys.exit(1)
+    if len(sys.argv) >= 3:
+        filename = sys.argv[2]
+        try:
+            content = read_file(filename)
+        except FileNotFoundError:
+            print(f"Error: File '{filename}' not found.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        content = read_clipboard()
+        if not content.startswith("SecurityCheck by "):
+            print("Error: Clipboard content does not start with 'SecurityCheck by '.", file=sys.stderr)
+            sys.exit(1)
 
     results = parse_lines(content)
     output = format_malwarebytes(results) if mode == 'malwarebytes' else format_reddit(results)
