@@ -3,24 +3,50 @@ import re
 
 
 def read_file(filename):
-    content = None
+    """Read a log, trying the encodings SecurityCheck is known to write."""
     for encoding in ('utf-16', 'utf-8-sig', 'utf-8', 'latin-1'):
         try:
             with open(filename, encoding=encoding) as f:
-                content = f.read()
-            break
+                return f.read()
         except (UnicodeDecodeError, UnicodeError):
             continue
-    if content is None:
-        print(f"Error: Could not read '{filename}'", file=sys.stderr)
-        sys.exit(1)
-    return content
+    raise ValueError(f"Could not decode '{filename}'")
 
 
-def _extract_plain_reason(line):
-    after = re.sub(r'.*\[b\]Warning!\[/b\]\s*', '', line)
-    after = re.sub(r'\[/?[^\]]+\]', '', after)
-    return after.strip()
+# SecurityCheck exists in several locales/versions, so every marker has variants:
+# "Warning!" (current EN), "Attention!" (older EN builds), "Внимание!" (RU).
+WARN = r'(?:Warning!|Attention!|Внимание!)'
+DOWNLOAD_LABEL = r'(?:Download\s+Updates?|Скачать\s+обновления)'
+EOL = r'(?:no longer supported|больше не поддерживается)'
+REMOTE = r'(?:Remote desktop software!|Remote access program!|Программа для удал[её]нного)'
+SETTING_LABEL = r'(User Account Control|The elevation prompt for .+?)'
+UAC_LINE = r'^' + SETTING_LABEL + r'\s*\[color=red\]\[b\](.+?)\[/b\]'
+RECOMMEND = r'(?:It is recommended to uninstall|Uninstallation recommended|Рекомендуется удалить|Рекомендуется деинсталляция)'
+
+
+def _strip_bb(text):
+    text = re.sub(r'\[i\].*?\[/i\]', '', text)
+    text = re.sub(r'\[/?[^\]]*\]', '', text)
+    return re.sub(r'\s+', ' ', text.replace('^', '')).strip(' .')
+
+
+def _app_name(line):
+    """Everything before the first bbcode tag is the program name."""
+    return re.split(r'\s*\[(?:b|color|i|url)[^\]]*\]', line, maxsplit=1)[0].strip()
+
+
+def _warning_segments(line):
+    """Split a line into one chunk per warning marker (a line can carry several).
+
+    Returns (offset, text) pairs; the offset is the chunk's position in the line,
+    so a link belonging to a chunk can be looked up without rescanning the rest.
+    """
+    marks = list(re.finditer(WARN, line))
+    segments = []
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(line)
+        segments.append((m.end(), line[m.end():end]))
+    return segments
 
 
 def parse_lines(content):
@@ -28,133 +54,178 @@ def parse_lines(content):
     windows_version = None
     for line in content.splitlines():
         line = line.strip()
+        if not line:
+            continue
 
         win_match = re.match(r'(Windows \d+ \S+ \(\w+\)) Release: (\w+)', line)
         if win_match:
             windows_version = f"{win_match.group(1)} {win_match.group(2)}"
+            continue
 
-        if '[color=red]' in line and 'Warning!' in line and 'Download Update' in line:
-            app_part = re.sub(r'\s*\[color=red\].*$', '', line).strip()
-            url_match = re.search(r'\[url=(.*?)\]Download Update\[/url\]', line)
-            if url_match:
-                if app_part == 'Extended support has ended' and windows_version:
-                    app_part = f"{windows_version} - Extended support has ended"
-                results.append({'type': 'update', 'app': app_part, 'url': url_match.group(1)})
+        uac_match = re.match(UAC_LINE, line)
+        if uac_match:
+            results.append({'type': 'setting', 'setting': uac_match.group(1).strip(),
+                            'state': _strip_bb(uac_match.group(2))})
+            continue
 
-        elif '[color=red]' in line and 'no longer supported' in line.lower():
-            app_part = re.sub(r'\s*\[b\]\[color=red\].*$', '', line).strip()
-            url_match = re.search(r'\[url=(.*?)\]', line)
-            if url_match:
-                results.append({'type': 'eol', 'app': app_part, 'url': url_match.group(1)})
+        # Standalone red system setting, e.g. "Never check for updates" or a
+        # fully wrapped "[color=red][b]User Account Control [b]disabled[/b][/b][/color]".
+        if line.startswith('[color=red]') and not _app_name(line):
+            text = _strip_bb(line)
+            if text:
+                labelled = re.match(SETTING_LABEL + r'\s+(.+)$', text)
+                if labelled:
+                    results.append({'type': 'setting', 'setting': labelled.group(1),
+                                    'state': labelled.group(2)})
+                else:
+                    results.append({'type': 'setting', 'setting': text, 'state': ''})
+            continue
 
-        elif '[color=blue]' in line and '[url=' in line:
+        # Standalone advice line printed underneath the program it belongs to.
+        if line.startswith('[color=blue]'):
             url_match = re.search(r'\[url=(.*?)\]([^\[]+)\[/url\]', line)
-            if url_match:
-                results.append({'type': 'note', 'subject': url_match.group(2).strip(), 'url': url_match.group(1)})
+            if url_match and 'update errors' in _strip_bb(line).lower():
+                results.append({'type': 'note', 'subject': url_match.group(2).strip(),
+                                'url': url_match.group(1)})
+            else:
+                hint = _strip_bb(line)
+                if hint and results:
+                    previous = results[-1].get('hint')
+                    results[-1]['hint'] = f"{previous}; {hint}" if previous else hint
+            continue
 
-        elif 'Remote desktop software!' in line:
-            app_part = re.sub(r'\s*\[b\]\[color=red\].*$', '', line).strip()
-            if app_part:
-                results.append({'type': 'remote_desktop', 'app': app_part})
+        has_warning = bool(re.search(WARN, line))
+        if not has_warning and not re.search(RECOMMEND, line, re.I):
+            continue
 
-        elif '[color=red]' in line and 'Warning!' in line:
-            app_part = re.sub(r'\s*\[b\]\[color=red\].*$', '', line).strip()
-            reason_match = re.search(r'\[color=red\]Warning!\s*(.*?)\[/color\]', line)
-            reason = reason_match.group(1).strip() if reason_match else ''
-            if app_part:
-                results.append({'type': 'unwanted', 'app': app_part, 'reason': reason})
+        app = _app_name(line)
+        if not app:
+            continue
 
-        elif '[b]Warning![/b]' in line:
-            app_part = re.sub(r'\s*\[b\]Warning!\[/b\].*$', '', line).strip()
-            if app_part:
-                results.append({'type': 'unwanted', 'app': app_part, 'reason': _extract_plain_reason(line)})
+        if not has_warning:
+            reason = _strip_bb(line[len(app):])
+            if reason:
+                results.append({'type': 'unwanted', 'app': app, 'reason': reason})
+            continue
+        if app == 'Extended support has ended' and windows_version:
+            app = f"{windows_version} - Extended support has ended"
+
+        handled = False
+        segments = _warning_segments(line)
+        # Only a notice that belongs to a warning counts; the same words inside
+        # a PUP description must not turn the entry into an end-of-life one.
+        eol_at = next((offset + m.start() for offset, text in segments
+                       for m in [re.search(EOL, text, re.I)] if m), None)
+
+        # A dead product is not worth updating, so end-of-life wins over the
+        # update link such a line often carries as well.
+        if eol_at is None:
+            for url in re.findall(r'\[url=(.*?)\]\s*' + DOWNLOAD_LABEL + r'\s*\[/url\]', line, re.I):
+                results.append({'type': 'update', 'app': app, 'url': url})
+                handled = True
+        else:
+            # The replacement link follows the notice; older builds print none.
+            url_match = re.search(r'\[url=(.*?)\]', line[eol_at:])
+            results.append({'type': 'eol', 'app': app,
+                            'url': url_match.group(1) if url_match else None})
+            handled = True
+
+        if re.search(REMOTE, line, re.I):
+            results.append({'type': 'remote_desktop', 'app': app})
+            handled = True
+
+        for _, segment in segments:
+            reason = _strip_bb(segment)
+            if not reason:
+                continue
+            if re.fullmatch(DOWNLOAD_LABEL, reason, re.I):
+                continue
+            if re.search(EOL, reason, re.I) or re.search(REMOTE, reason, re.I):
+                continue
+            results.append({'type': 'unwanted', 'app': app, 'reason': reason})
+            handled = True
+
+        if not handled:
+            results.append({'type': 'unwanted', 'app': app, 'reason': ''})
 
     return results
 
 
-def format_malwarebytes(results):
+def _hint(r):
+    return f" ({r['hint']})" if r.get('hint') else ""
+
+
+# Section headings, in output order. Outdated / end-of-life software belongs
+# with the programs to uninstall, not with the ones that can simply be updated.
+SECTIONS = (
+    (('update',), "Please update the following software:"),
+    (('unwanted', 'eol'), "Please remove the following potentially unwanted programs (PUP):"),
+    (('remote_desktop',), "Please let me know whether you recognize this remote desktop software (if not, uninstall it):"),
+    (('setting',), "Please check the following Windows settings:"),
+)
+
+
+def _format(results, markdown):
+    """Render the parsed results as plain text, or as Reddit-flavoured markdown."""
+    def bold(text):
+        return f"**{text}**" if markdown else text
+
+    def bullet(text):
+        return f"* {text}" if markdown else text
+
+    def link(url, label):
+        return f"[{label}]({url})" if markdown else f"{label} {url}"
+
+    def entry(r):
+        if r['type'] == 'update':
+            label = "New update available, download here" if markdown else "Download Update"
+            return f"{bold(r['app'])} | {link(r['url'], label)}"
+        if r['type'] == 'eol':
+            reason = "No longer supported - please uninstall it"
+            if r.get('url'):
+                replacement = link(r['url'], "replace it here" if markdown else "replace it with")
+                reason = f"{reason} and {replacement}"
+            return f"{bold(r['app'])} - {reason}"
+        if r['type'] == 'setting':
+            state = f" - {r['state']}" if r['state'] else ""
+            return f"{bold(r['setting'])}{state}"
+        reason = r.get('reason', '')
+        return f"{bold(r['app'])} - {reason}" if reason else bold(r['app'])
+
     lines = []
-
-    updates = [r for r in results if r['type'] in ('update', 'eol')]
-    unwanted = [r for r in results if r['type'] == 'unwanted']
-    remote_desktops = [r for r in results if r['type'] == 'remote_desktop']
-    notes = [r for r in results if r['type'] == 'note']
-
-    if updates:
-        lines.append("Please update the following software:")
-        for r in updates:
-            if r['type'] == 'update':
-                lines.append(f"{r['app']} | Download Update {r['url']}")
-            elif r['type'] == 'eol':
-                lines.append(f"{r['app']} | No longer supported - Replace with {r['url']}")
+    for types, heading in SECTIONS:
+        section = [r for r in results if r['type'] in types]
+        if not section:
+            continue
+        lines.append(bold(heading))
+        lines.extend(bullet(entry(r)) + _hint(r) for r in section)
         lines.append("")
 
-    if unwanted:
-        lines.append("Please remove the following potentially unwanted programs (PUP):")
-        for r in unwanted:
-            reason = r.get('reason', '')
-            lines.append(f"{r['app']} - {reason}" if reason else r['app'])
-        lines.append("")
-
-    if remote_desktops:
-        lines.append("Please let me know whether you recognize this remote desktop software:")
-        for r in remote_desktops:
-            lines.append(r['app'])
-        lines.append("")
-
-    for r in notes:
-        lines.append(f"Note: If {r['subject']} update errors occur, reinstall from {r['url']}")
+    for r in results:
+        if r['type'] == 'note':
+            note = f"Note: If {r['subject']} update errors occur, " + link(
+                r['url'], "reinstall here" if markdown else "reinstall from")
+            lines.append(f"*{note}*" if markdown else note)
 
     return lines
+
+
+def format_malwarebytes(results):
+    return _format(results, markdown=False)
 
 
 def format_reddit(results):
-    lines = []
-
-    updates = [r for r in results if r['type'] in ('update', 'eol')]
-    unwanted = [r for r in results if r['type'] == 'unwanted']
-    remote_desktops = [r for r in results if r['type'] == 'remote_desktop']
-    notes = [r for r in results if r['type'] == 'note']
-
-    if updates:
-        lines.append("**Please update the following software:**")
-        for r in updates:
-            if r['type'] == 'update':
-                lines.append(f"* **{r['app']}** | [New update available, download here]({r['url']})")
-            elif r['type'] == 'eol':
-                lines.append(f"* **{r['app']}** | [No longer supported, replace here]({r['url']})")
-        lines.append("")
-
-    if unwanted:
-        lines.append("**Please remove the following potentially unwanted programs (PUP):**")
-        for r in unwanted:
-            reason = r.get('reason', '')
-            lines.append(f"* **{r['app']}** - {reason}" if reason else f"* **{r['app']}**")
-        lines.append("")
-
-    if remote_desktops:
-        lines.append("**Please let me know whether you recognize this remote desktop software:**")
-        for r in remote_desktops:
-            lines.append(f"* **{r['app']}**")
-        lines.append("")
-
-    for r in notes:
-        lines.append(f"*Note: If {r['subject']} update errors occur, [reinstall here]({r['url']})*")
-
-    return lines
+    return _format(results, markdown=True)
 
 
 def read_clipboard():
+    import tkinter as tk
+    root = tk.Tk()
+    root.withdraw()
     try:
-        import tkinter as tk
-        root = tk.Tk()
-        root.withdraw()
-        text = root.clipboard_get()
+        return root.clipboard_get()
+    finally:
         root.destroy()
-        return text
-    except Exception as e:
-        print(f"Error: Could not read clipboard: {e}", file=sys.stderr)
-        sys.exit(1)
 
 
 if __name__ == '__main__':
@@ -176,8 +247,15 @@ if __name__ == '__main__':
         except FileNotFoundError:
             print(f"Error: File '{filename}' not found.", file=sys.stderr)
             sys.exit(1)
+        except (OSError, ValueError) as e:
+            print(f"Error: Could not read '{filename}': {e}", file=sys.stderr)
+            sys.exit(1)
     else:
-        content = read_clipboard()
+        try:
+            content = read_clipboard()
+        except Exception as e:
+            print(f"Error: Could not read clipboard: {e}", file=sys.stderr)
+            sys.exit(1)
         if not content.startswith("SecurityCheck by "):
             print("Error: Clipboard content does not start with 'SecurityCheck by '.", file=sys.stderr)
             sys.exit(1)
